@@ -1,0 +1,63 @@
+<Page x:Class="PrivacyGuard.App.Pages.AutoDetectedPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="Found on this PC"
+      Foreground="{DynamicResource TextFillColorPrimaryBrush}">
+    <Grid Margin="32,16,32,24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0">
+            <TextBlock Text="Found on this PC" FontSize="28" FontWeight="SemiBold" />
+            <TextBlock Margin="0,4,0,0" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                       Text="Your username, computer name, Wi-Fi network and local IP address are easy to leak by accident. Pick the ones to protect. Nothing leaves this PC." />
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,18,0,16">
+            <ui:Button x:Name="AddButton" Content="Protect selected" Appearance="Primary"
+                       Icon="{ui:SymbolIcon ShieldCheckmark24}" Click="AddSelected_Click" />
+            <ui:Button Content="Scan again" Margin="8,0,0,0" Icon="{ui:SymbolIcon ArrowSync24}" Click="Scan_Click" />
+            <TextBlock x:Name="StatusText" VerticalAlignment="Center" Margin="16,0,0,0"
+                       Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+            <ItemsControl ItemsSource="{Binding Items}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Border Margin="0,0,0,8" Padding="16,12" CornerRadius="8" BorderThickness="1"
+                                Background="{DynamicResource CardBackgroundFillColorDefaultBrush}"
+                                BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <CheckBox Grid.Column="0" VerticalAlignment="Center" MinWidth="0" Margin="0,0,12,0"
+                                          IsChecked="{Binding Selected, Mode=TwoWay}"
+                                          IsEnabled="{Binding CanSelect}" />
+
+                                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding Value}" FontWeight="SemiBold" FontFamily="Consolas" />
+                                    <TextBlock Text="{Binding Category}" Margin="0,2,0,0"
+                                               Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                                </StackPanel>
+
+                                <TextBlock Grid.Column="2" Text="Already protected" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource SystemFillColorSuccessBrush}"
+                                           Visibility="{Binding AlreadyAddedVisibility}" />
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+    </Grid>
+</Page>

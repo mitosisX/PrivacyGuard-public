@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="PrivacyGuard.App/PrivacyGuard.App.csproj" />
+  <Project Path="PrivacyGuard.Core/PrivacyGuard.Core.csproj" Id="9cfc8648-724f-4417-b2fe-5893de4435ba" />
+  <Project Path="PrivacyGuard.Engine/PrivacyGuard.Engine.csproj" />
+  <Project Path="PrivacyGuard.Tests/PrivacyGuard.Tests.csproj" />
+</Solution>
