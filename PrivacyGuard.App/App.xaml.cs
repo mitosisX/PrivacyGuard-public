@@ -14,8 +14,24 @@ public partial class App : Application
     private TaskbarIcon? _tray;
     private MenuItem? _liveMenuItem;
 
+    // One copy per Windows account. Two would run two engines and draw two sets of boxes.
+    private const string InstanceName = @"Local\PrivacyGuard.SingleInstance";
+    private const string ShowSignalName = @"Local\PrivacyGuard.ShowWindow";
+    private static Mutex? _instanceLock;
+
     protected override void OnStartup(StartupEventArgs e)
     {
+        if (!ClaimSingleInstance())
+        {
+            MessageBox.Show(
+                "PrivacyGuard is already running.\n\nIt may be hidden in the system tray. Click OK to open it.",
+                "PrivacyGuard", MessageBoxButton.OK, MessageBoxImage.Information);
+            SignalRunningInstance();
+            // Leave before the main window, the engine or the tray icon are created.
+            Environment.Exit(0);
+            return;
+        }
+
         DispatcherUnhandledException += OnUnhandledException;
 
         // The shield keeps running in the tray after the window is closed.
@@ -30,6 +46,43 @@ public partial class App : Application
 
         if (services.Settings.LiveProtection && services.SetLiveProtection(true) is { } error)
             MessageBox.Show("Live protection could not start.\n\n" + error, "PrivacyGuard", MessageBoxButton.OK, MessageBoxImage.Warning);
+    }
+
+    /// <summary>
+    /// True if this is the only copy running for this Windows account. The first copy also starts
+    /// listening for later copies asking it to come to the front.
+    /// </summary>
+    private bool ClaimSingleInstance()
+    {
+        _instanceLock = new Mutex(initiallyOwned: true, InstanceName, out var createdNew);
+        if (!createdNew)
+        {
+            _instanceLock.Dispose();
+            _instanceLock = null;
+            return false;
+        }
+
+        var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, ShowSignalName);
+        new Thread(() =>
+        {
+            while (showSignal.WaitOne())
+                Dispatcher.BeginInvoke(ShowMainWindow);
+        })
+        { IsBackground = true, Name = "PrivacyGuard show requests" }.Start();
+        return true;
+    }
+
+    private static void SignalRunningInstance()
+    {
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(ShowSignalName, out var signal))
+                using (signal) signal.Set();
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+        {
+            // The running copy keeps going either way; it just is not brought forward.
+        }
     }
 
     private void CreateTray()
@@ -91,6 +144,9 @@ public partial class App : Application
         AppServices.Current.Engine.Stop();
         _tray?.Dispose();
         _tray = null;
+        _instanceLock?.ReleaseMutex();
+        _instanceLock?.Dispose();
+        _instanceLock = null;
         Shutdown();
     }
 
