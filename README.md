@@ -67,8 +67,8 @@ app on its own, without the boxes.
 Requirements: Windows 10/11 and the [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
 ```powershell
-git clone https://github.com/mitosisX/PrivacyGuardApp.git
-cd PrivacyGuardApp
+git clone https://github.com/mitosisX/PrivacyGuard-public.git
+cd PrivacyGuard-public
 dotnet build -c Release
 dotnet test
 .\PrivacyGuard.App\bin\Release\net10.0-windows10.0.22621.0\PrivacyGuard.App.exe
