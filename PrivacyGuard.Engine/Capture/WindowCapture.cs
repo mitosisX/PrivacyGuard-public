@@ -33,6 +33,9 @@ internal sealed class WindowCapture : IDisposable
     public int Height { get; private set; }
     public long LastProcessedMs { get; set; }
 
+    /// <summary>True while a frame has arrived that <see cref="TryAcquire"/> has not taken yet.</summary>
+    public bool HasPendingFrame => Volatile.Read(ref _pending) != 0;
+
     /// <summary>When Windows captured the held frame, in milliseconds on the performance-counter clock.</summary>
     public double FrameTimeMs { get; private set; } = double.NaN;
 

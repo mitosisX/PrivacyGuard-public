@@ -544,7 +544,7 @@ public sealed class LiveEngine : IDisposable
 
         while (!_stopping)
         {
-            _signal.WaitOne(30);
+            _signal.WaitOne(_nextWakeMs);
             try
             {
                 WorkerTick();
@@ -562,12 +562,25 @@ public sealed class LiveEngine : IDisposable
         _gpu = null;
     }
 
+    /// <summary>
+    /// How long the worker sleeps when nothing wakes it. Normally 30 ms; shorter when a window
+    /// has a frame waiting that was skipped by the frame budget, so it is read the moment it
+    /// becomes eligible rather than up to 30 ms later.
+    /// </summary>
+    private int _nextWakeMs = IdleWakeMs;
+    private const int IdleWakeMs = 30;
+
     private void WorkerTick()
     {
         var now = Environment.TickCount64;
         var changed = false;
+        _nextWakeMs = IdleWakeMs;
 
         while (_commands.TryDequeue(out var command)) command();
+
+        // Finished OCR goes up first. Reading frames below can stall on the GPU for tens of
+        // milliseconds when it is busy; text that has already been found must not wait for that.
+        if (ApplyOcrResults(now)) PublishSnapshot();
 
         foreach (var capture in _captures.Values.ToList())
         {
@@ -588,15 +601,19 @@ public sealed class LiveEngine : IDisposable
                 var minInterval = known.IsScrolling(now) ? 0
                     : known.Boxes.Count == 0 && known.AnimatedFraction > 0.3 ? 66
                     : 33;
-                if (now - capture.LastProcessedMs < minInterval) continue;
+                var wait = minInterval - (now - capture.LastProcessedMs);
+                if (wait > 0)
+                {
+                    if (capture.HasPendingFrame) _nextWakeMs = Math.Min(_nextWakeMs, (int)Math.Max(1, wait));
+                    continue;
+                }
             }
 
             if (!capture.TryAcquire() || capture.Texture is null) continue;
             capture.LastProcessedMs = now;
 
             var stageStart = Stopwatch.GetTimestamp();
-            _gpu!.ReadHalfGray(capture.Texture, capture.Width, capture.Height, _half);
-            _gpu.ReadStripsGray(capture.Texture, capture.Width, capture.Height, _strip);
+            _gpu!.ReadFrameGray(capture.Texture, capture.Width, capture.Height, _half, _strip);
             _framesThisSecond++;
             Diag(capture.Hwnd).Frames++;
             if (!_trackers.TryGetValue(capture.Hwnd, out var tracker))
@@ -606,24 +623,6 @@ public sealed class LiveEngine : IDisposable
             changed |= tracker.OnFrame(_half, capture.Width, capture.Height, now, capture.FrameTimeMs, _strip);
             _trackMsThisSecond += Stopwatch.GetElapsedTime(trackStart).TotalMilliseconds;
             DebugDump(capture.Hwnd, tracker);
-        }
-
-        while (_ocrResults.TryDequeue(out var result))
-        {
-            _slotBusy[result.Slot] = false;
-            _ocrThisSecond++;
-            if (StatsLogging) TraceOcr(result);
-            var diag = Diag(result.Request.Tracker.Hwnd);
-            diag.OcrRuns++;
-            diag.LastOcrLines = result.Lines;
-            diag.LastDetections = result.Detections.Count;
-            _ocrAverageMs = _ocrAverageMs == 0 ? result.Ms : _ocrAverageMs * 0.8 + result.Ms * 0.2;
-            _ocrMsThisSecond += result.Ms;
-            if (_trackers.TryGetValue(result.Request.Tracker.Hwnd, out var t) && ReferenceEquals(t, result.Request.Tracker))
-            {
-                t.ApplyOcr(result.Request, result.Detections, now);
-                changed = true;
-            }
         }
 
         foreach (var t in _trackers.Values) changed |= t.SettleIfIdle(now);
@@ -646,6 +645,30 @@ public sealed class LiveEngine : IDisposable
             UpdateDiagnostics();
             LogStatsIfEnabled(now);
         }
+    }
+
+    /// <summary>Folds every finished OCR job into its tracker. Returns true if any boxes may have changed.</summary>
+    private bool ApplyOcrResults(long now)
+    {
+        var changed = false;
+        while (_ocrResults.TryDequeue(out var result))
+        {
+            _slotBusy[result.Slot] = false;
+            _ocrThisSecond++;
+            if (StatsLogging) TraceOcr(result);
+            var diag = Diag(result.Request.Tracker.Hwnd);
+            diag.OcrRuns++;
+            diag.LastOcrLines = result.Lines;
+            diag.LastDetections = result.Detections.Count;
+            _ocrAverageMs = _ocrAverageMs == 0 ? result.Ms : _ocrAverageMs * 0.8 + result.Ms * 0.2;
+            _ocrMsThisSecond += result.Ms;
+            if (_trackers.TryGetValue(result.Request.Tracker.Hwnd, out var t) && ReferenceEquals(t, result.Request.Tracker))
+            {
+                t.ApplyOcr(result.Request, result.Detections, now);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     // ---- diagnostics only ----------------------------------------------------------
