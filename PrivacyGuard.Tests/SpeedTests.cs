@@ -110,17 +110,57 @@ public class SpeedTests
         var page = FakePage.Create(W, 3000);
         var tracker = new WindowTracker(new IntPtr(1));
         tracker.OnFrame(FakePage.Viewport(page, 1000, H), W * 2, H * 2, 0);
+        DrainOcr(tracker, 0);
 
-        // A big window is read at normal size first, then re-read enlarged in strips (background work).
-        var scan = tracker.TakeOcrRequest(0, false, urgentOnly: true)!;
-        Assert.True(scan.IsFullScan);
-        Assert.True(scan.Urgent);
-        tracker.ApplyOcr(scan, [], 0);
+        // A minute later the page is re-read in the background: normal size first, then
+        // enlarged strips. None of that is urgent, so the second reader leaves it alone.
+        var rescan = tracker.TakeOcrRequest(61_000, allowPeriodic: true)!;
+        Assert.True(rescan.IsFullScan);
+        tracker.ApplyOcr(rescan, [], 61_000);
 
-        Assert.Null(tracker.TakeOcrRequest(10, false, urgentOnly: true));
-        var detail = tracker.TakeOcrRequest(10, false);
+        Assert.Null(tracker.TakeOcrRequest(61_010, false, urgentOnly: true));
+        var detail = tracker.TakeOcrRequest(61_010, false);
         Assert.NotNull(detail);
         Assert.False(detail!.Urgent);
+    }
+
+    [Fact]
+    public void Detail_strips_of_a_new_page_are_urgent_so_both_readers_share_them()
+    {
+        var page = FakePage.Create(W, 3000);
+        var tracker = new WindowTracker(new IntPtr(1));
+        tracker.OnFrame(FakePage.Viewport(page, 1000, H), W * 2, H * 2, 0);
+
+        // The first read of a big window goes at normal size; small text waits for the
+        // enlarged strips. Those strips are part of covering a new page, not a background re-read.
+        var scan = tracker.TakeOcrRequest(0, false, urgentOnly: true)!;
+        Assert.True(scan.IsFullScan);
+        tracker.ApplyOcr(scan, [], 0);
+
+        var strip = tracker.TakeOcrRequest(10, false, urgentOnly: true);
+        Assert.NotNull(strip);
+        Assert.False(strip!.IsFullScan);
+        Assert.True(strip.Urgent);
+    }
+
+    [Fact]
+    public void A_resize_defers_the_full_rescan_until_the_size_settles()
+    {
+        var (tracker, page) = StartWithBox();
+        DrainOcr(tracker, 0);
+
+        // The window grows: a frame of a new size. Nothing is read while it keeps changing...
+        tracker.OnFrame(FakePage.Viewport(page, 1000, H + 20), W * 2, (H + 20) * 2, 100);
+        Assert.Null(tracker.TakeOcrRequest(100, false));
+        Assert.Null(tracker.TakeOcrRequest(100 + WindowTracker.ResizeSettleMs - 1, false));
+
+        // ...the old box stays up as a safe guess meanwhile...
+        Assert.True(Assert.Single(tracker.Boxes).NeedsOcrConfirm);
+
+        // ...and once the size has settled, the whole window is read on the new layout.
+        var scan = tracker.TakeOcrRequest(100 + WindowTracker.ResizeSettleMs, false);
+        Assert.NotNull(scan);
+        Assert.True(scan!.IsFullScan);
     }
 
     [Fact]

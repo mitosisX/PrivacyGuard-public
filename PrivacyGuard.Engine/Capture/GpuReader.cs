@@ -86,8 +86,26 @@ internal sealed unsafe class GpuReader : IDisposable
         }
     }
 
-    /// <summary>Downscales the top-left width x height of <paramref name="source"/> by 2 into <paramref name="destination"/>.</summary>
-    public void ReadHalfGray(ID3D11Texture2D source, int width, int height, GrayImage destination)
+    /// <summary>
+    /// Reads one captured frame as the half-resolution image tracking runs on, plus the
+    /// full-resolution strips scroll is measured on. All GPU work is queued first and waited for
+    /// once: mapping a staging texture blocks until the GPU has caught up, and two separate waits
+    /// per frame cost two round trips, which on a busy GPU were most of the engine's frame time.
+    /// </summary>
+    public void ReadFrameGray(ID3D11Texture2D source, int width, int height, GrayImage half, GrayImage strip)
+    {
+        var (hw, hh) = QueueHalf(source, width, height);
+        var stripWidth = QueueStrips(source, width, height);
+        _context.Flush();
+
+        half.Resize(hw, hh);
+        ReadStaging(_halfStaging!, hw, hh, half.Pixels);
+        strip.Resize(stripWidth, height);
+        ReadStaging(_stripStaging!, stripWidth, height, strip.Pixels);
+    }
+
+    /// <summary>Queues the downscale of the top-left width x height of <paramref name="source"/> by 2 into the half staging texture.</summary>
+    private (int Width, int Height) QueueHalf(ID3D11Texture2D source, int width, int height)
     {
         EnsureMip(width, height);
         _context.CopySubresourceRegion(_mip!, 0, 0, 0, 0, source, 0, new Box(0, 0, 0, width, height, 1));
@@ -97,16 +115,20 @@ internal sealed unsafe class GpuReader : IDisposable
         var hh = Math.Max(1, height / 2);
         EnsureHalfStaging(hw, hh);
         _context.CopySubresourceRegion(_halfStaging!, 0, 0, 0, 0, _mip!, 1, new Box(0, 0, 0, hw, hh, 1));
+        return (hw, hh);
+    }
 
-        destination.Resize(hw, hh);
-        _context.Map(_halfStaging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out var mapped).CheckError();
+    /// <summary>Waits for the GPU if needed, then converts a staging texture to luma.</summary>
+    private void ReadStaging(ID3D11Texture2D staging, int width, int height, byte[] destination)
+    {
+        _context.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out var mapped).CheckError();
         try
         {
-            ToGray((byte*)mapped.DataPointer, (int)mapped.RowPitch, hw, hh, destination.Pixels);
+            ToGray((byte*)mapped.DataPointer, (int)mapped.RowPitch, width, height, destination);
         }
         finally
         {
-            _context.Unmap(_halfStaging!, 0);
+            _context.Unmap(staging, 0);
         }
     }
 
@@ -135,12 +157,13 @@ internal sealed unsafe class GpuReader : IDisposable
     }
 
     /// <summary>
-    /// Reads three narrow full-resolution vertical strips (at 1/10, 1/2 and 9/10 of the width)
-    /// side by side into <paramref name="destination"/>. Scroll is measured on these: at full
-    /// resolution a scroll by any whole number of pixels lines up exactly, which half-size frames
-    /// cannot do for odd distances. About a fifth of the pixels of the full frame.
+    /// Queues the copy of three narrow full-resolution vertical strips (at 1/10, 1/2 and 9/10 of
+    /// the width) side by side into the strip staging texture. Scroll is measured on these: at
+    /// full resolution a scroll by any whole number of pixels lines up exactly, which half-size
+    /// frames cannot do for odd distances. About a fifth of the pixels of the full frame.
     /// </summary>
-    public void ReadStripsGray(ID3D11Texture2D source, int width, int height, GrayImage destination)
+    /// <returns>The combined width of the strips.</returns>
+    private int QueueStrips(ID3D11Texture2D source, int width, int height)
     {
         var (count, stripWidth) = StripLayout(width);
         var totalWidth = count * stripWidth;
@@ -159,17 +182,7 @@ internal sealed unsafe class GpuReader : IDisposable
             _context.CopySubresourceRegion(_stripStaging, 0, (uint)(i * stripWidth), 0, 0, source, 0,
                 new Box(x0, 0, 0, x0 + stripWidth, height, 1));
         }
-
-        destination.Resize(totalWidth, height);
-        _context.Map(_stripStaging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None, out var mapped).CheckError();
-        try
-        {
-            ToGray((byte*)mapped.DataPointer, (int)mapped.RowPitch, totalWidth, height, destination.Pixels);
-        }
-        finally
-        {
-            _context.Unmap(_stripStaging, 0);
-        }
+        return totalWidth;
     }
 
     /// <summary>

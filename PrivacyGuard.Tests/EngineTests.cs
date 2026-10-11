@@ -445,6 +445,33 @@ public class WindowTrackerTests
     }
 
     [Fact]
+    public void A_jump_between_frames_far_apart_is_not_motion_to_extrapolate()
+    {
+        var (tracker, page) = StartWithBoxAt(1000, new RectI(100, 400, 240, 14));
+        // A wheel notch in an app without smooth scrolling: the page moves 100 px in one frame,
+        // 200 ms after the previous one. Nothing is in motion, so the box must sit on the text
+        // instead of gliding on at 0.5 px/ms.
+        tracker.OnFrame(FakePage.Viewport(page, 1000, H), W * 2, H * 2, 100, frameTimeMs: 100);
+        tracker.OnFrame(FakePage.Viewport(page, 1050, H), W * 2, H * 2, 300, frameTimeMs: 300);
+
+        var snap = tracker.Snapshot(strict: false);
+        var box = snap.Boxes.Single();
+        Assert.Equal(0, box.VelocityPerMs);
+        Assert.Equal(box.Rect, WindowTracker.PredictAt(box, snap.FrameTimeMs, snap.FrameIntervalMs, 310 + WindowTracker.PresentLagMs));
+    }
+
+    [Fact]
+    public void Prediction_horizon_follows_the_display_rate_not_slow_frame_timing()
+    {
+        var box = new MovingRect(new RectI(100, 400, 240, 20), VelocityPerMs: -1);
+        // Frames that happened to come 200 ms apart must not license flying 300 px ahead for
+        // half a second: a scroll only needs bridging to the next display frame.
+        var ahead = WindowTracker.PredictAt(box, frameTimeMs: 0, frameIntervalMs: 200, targetTimeMs: 100);
+        Assert.InRange(box.Rect.Y - ahead.Y, 0, 90);
+        Assert.Equal(box.Rect, WindowTracker.PredictAt(box, frameTimeMs: 0, frameIntervalMs: 200, targetTimeMs: 300));
+    }
+
+    [Fact]
     public void Box_is_removed_when_its_text_scrolls_out_of_view()
     {
         var (tracker, page) = StartWithBoxAt(1000, new RectI(100, 40, 200, 14));

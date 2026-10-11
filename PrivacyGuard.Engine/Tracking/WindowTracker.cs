@@ -86,6 +86,21 @@ public sealed class WindowTracker
     public const double WideAcceptScore = 0.9;
     private const int MaxBandHeight = 600;
 
+    /// <summary>
+    /// How long a window's size must hold still before it is read again as a whole. A drag-resize
+    /// delivers a new size every frame; reading each one (a full pass plus enlarged strips, about
+    /// 230 ms of OCR) kept the reader busy and made new text in other windows wait.
+    /// </summary>
+    public const long ResizeSettleMs = 150;
+
+    /// <summary>
+    /// Longest gap between two frames that still counts as continuous motion. A page that moved
+    /// 100 px in one frame 200 ms after the previous one (a wheel notch in an app without smooth
+    /// scrolling) is not moving at 0.5 px/ms; extrapolating that glided boxes 165 px past their
+    /// text and back on every notch.
+    /// </summary>
+    public const double ContinuousFrameMs = 50;
+
     private GrayImage _latest = new(1, 1);
     private GrayImage _scratch = new(1, 1);
     private int[] _prevProfile = [];
@@ -96,8 +111,12 @@ public sealed class WindowTracker
     private long _lastFrameMs;
     private long _lastFullScanMs;
     private bool _needsFullScan = true;
+    private bool _fullScanIsPeriodic;
+    private long _fullScanNotBeforeMs;
     private bool _hasScanned;
     private int _detailY = -1;
+    /// <summary>The current detail strips finish covering a new page, rather than re-reading an old one.</summary>
+    private bool _detailUrgent;
     private int _nextRequestId;
 
     // Full-resolution vertical strips: scroll is measured on these when the engine provides them.
@@ -206,6 +225,8 @@ public sealed class WindowTracker
             if (resized)
             {
                 _layoutEpoch++;
+                _fullScanIsPeriodic = false;
+                _fullScanNotBeforeMs = nowMs + ResizeSettleMs;
                 foreach (var b in _boxes)
                 {
                     b.LostSinceMs ??= nowMs;
@@ -257,7 +278,8 @@ public sealed class WindowTracker
             _lastScrollMs = nowMs;
         }
         _windowVelocity = shiftFull;
-        _velocityPerMs = timed ? shiftFull / elapsed : 0;
+        var continuous = timed && elapsed <= ContinuousFrameMs;
+        _velocityPerMs = continuous ? shiftFull / elapsed : 0;
         LastShiftFull = shiftFull;
 
         var changes = ChangeDetector.FindNewContent(_latest, _scratch, ToHalf(shiftFull), grid: _dirtyGrid);
@@ -275,7 +297,7 @@ public sealed class WindowTracker
         }
         else
         {
-            TrackBoxes(_scratch, shiftFull, nowMs, timed ? elapsed : double.NaN);
+            TrackBoxes(_scratch, shiftFull, nowMs, continuous ? elapsed : double.NaN);
             if (shiftFull != 0) RestoreReturningItems(shiftFull, nowMs);
             // Something new appeared, perhaps a secret seen before: a panel re-opened, or a page
             // switch that looked like a scroll (two pages with the same line spacing). Only
@@ -409,6 +431,7 @@ public sealed class WindowTracker
         _inflight.Clear();
         _detailY = -1;
         _needsFullScan = true;
+        _fullScanIsPeriodic = false;
         _velocityPerMs = 0;
         _windowVelocity = 0;
     }
@@ -871,6 +894,7 @@ public sealed class WindowTracker
     public void RequestFullScan()
     {
         _needsFullScan = true;
+        _fullScanIsPeriodic = false;
         _readSpans.Clear();
     }
 
@@ -897,15 +921,19 @@ public sealed class WindowTracker
         if (!_hasFrame) return null;
 
         if (!_needsFullScan && _pending.Count == 0 && _detailY < 0 && allowPeriodic && nowMs - _lastFullScanMs > 60000)
+        {
             _needsFullScan = true;
+            _fullScanIsPeriodic = true;
+        }
 
         RectI crop;
         int scale;
         var isFull = false;
         var isNew = false;
+        var isDetail = false;
         var reading = new List<RectI>();
 
-        if (_needsFullScan)
+        if (_needsFullScan && nowMs >= _fullScanNotBeforeMs)
         {
             crop = FullBounds;
             // Small windows are read enlarged at once; anything bigger is read at normal size
@@ -918,8 +946,11 @@ public sealed class WindowTracker
             _lastFullScanMs = nowMs;
 
             // A big window is first read at normal size for speed, then re-read in enlarged
-            // strips so small text is not missed.
+            // strips so small text is not missed. For a new page those strips are as urgent as
+            // the first read, so a second reader may share them; a background re-read is not.
             _detailY = scale == 1 ? 0 : -1;
+            _detailUrgent = _detailY >= 0 && !_fullScanIsPeriodic;
+            _fullScanIsPeriodic = false;
         }
         else if (EligiblePending(nowMs) is { Count: > 0 } eligible)
         {
@@ -966,7 +997,8 @@ public sealed class WindowTracker
         }
         else if (_detailY >= 0)
         {
-            if (urgentOnly) return null;
+            if (urgentOnly && !_detailUrgent) return null;
+            isDetail = true;
             crop = new RectI(0, _detailY, FullWidth, Math.Min(320, FullHeight - _detailY)).Intersect(FullBounds);
             scale = 2;
             _detailY += 290;
@@ -994,7 +1026,7 @@ public sealed class WindowTracker
             Id = id,
             PageGeneration = _pageGeneration,
             LayoutEpoch = _layoutEpoch,
-            Urgent = isFull || isNew,
+            Urgent = isFull || isNew || (isDetail && _detailUrgent),
         };
     }
 
@@ -1156,6 +1188,12 @@ public sealed class WindowTracker
     public const double PresentLagMs = 30;
 
     /// <summary>
+    /// Longest frame interval the prediction horizon is based on. A moving box only needs
+    /// carrying to the next display frame; a slow or irregular source must not stretch that.
+    /// </summary>
+    public const double MaxPredictIntervalMs = 40;
+
+    /// <summary>
     /// Where a moving box should be drawn so it sits on its text at <paramref name="targetTimeMs"/>
     /// (now plus <see cref="PresentLagMs"/>). The box keeps its exact size: no margins, no trail.
     /// If the next frame is overdue the scroll has most likely stopped, so the box stays where
@@ -1168,8 +1206,9 @@ public sealed class WindowTracker
         var elapsed = targetTimeMs - frameTimeMs;
         if (elapsed <= 0) return box.Rect;
 
-        var horizon = frameIntervalMs * 1.5 + PresentLagMs;
-        if (elapsed > horizon + frameIntervalMs) return box.Rect;
+        var interval = Math.Min(frameIntervalMs, MaxPredictIntervalMs);
+        var horizon = interval * 1.5 + PresentLagMs;
+        if (elapsed > horizon + interval) return box.Rect;
 
         var dy = box.VelocityPerMs * Math.Min(elapsed, horizon);
         return box.Rect.Offset(0, (int)Math.Round(dy));
