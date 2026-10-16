@@ -24,8 +24,11 @@ public sealed class EngineOptions
     /// <summary>Protect PrivacyGuard's own windows too.</summary>
     public bool ProtectOwnWindows { get; set; } = true;
 
-    /// <summary>How many windows are watched at once. Bounds memory use.</summary>
-    public int MaxWindows { get; set; } = 8;
+    /// <summary>
+    /// How many windows are watched at once. Bounds memory use. A visible window beyond the
+    /// limit is not read at all, so this is set well above what a desktop normally shows.
+    /// </summary>
+    public int MaxWindows { get; set; } = 32;
 
     /// <summary>Box colour as 0xRRGGBB.</summary>
     public uint BoxColor { get; set; } = 0x111111;
@@ -88,8 +91,8 @@ public sealed class LiveEngine : IDisposable
     private readonly GrayImage _strip = new(1, 1);
     private IntPtr _foreground;
 
-    // OCR readers: one normally, a second for new content on PCs with cores to spare.
-    private static readonly int OcrReaders = Environment.ProcessorCount <= 2 ? 1 : 2;
+    // OCR readers: one for everything, plus extras for new content on PCs with cores to spare.
+    private static readonly int OcrReaders = Environment.ProcessorCount switch { <= 2 => 1, <= 4 => 2, _ => 3 };
     private OcrService?[] _ocrPool = [];
     private bool[] _slotBusy = [];
 
@@ -544,7 +547,7 @@ public sealed class LiveEngine : IDisposable
 
         while (!_stopping)
         {
-            _signal.WaitOne(_nextWakeMs);
+            _signal.WaitOne(IdleWakeMs);
             try
             {
                 WorkerTick();
@@ -563,18 +566,15 @@ public sealed class LiveEngine : IDisposable
     }
 
     /// <summary>
-    /// How long the worker sleeps when nothing wakes it. Normally 30 ms; shorter when a window
-    /// has a frame waiting that was skipped by the frame budget, so it is read the moment it
-    /// becomes eligible rather than up to 30 ms later.
+    /// How long the worker sleeps when nothing wakes it. Every new frame and finished OCR job
+    /// wakes it at once; this only paces housekeeping such as settling idle windows.
     /// </summary>
-    private int _nextWakeMs = IdleWakeMs;
     private const int IdleWakeMs = 30;
 
     private void WorkerTick()
     {
         var now = Environment.TickCount64;
         var changed = false;
-        _nextWakeMs = IdleWakeMs;
 
         while (_commands.TryDequeue(out var command)) command();
 
@@ -592,25 +592,8 @@ public sealed class LiveEngine : IDisposable
                 continue;
             }
 
-            // Frame budget per window, to keep the engine light:
-            //  - scrolling: every frame (60 fps), because boxes must keep up with the text;
-            //  - otherwise: up to 30 fps, plenty for text that appears in place;
-            //  - mostly animated (a game, a video) with nothing hidden: about 15 fps.
-            if (_trackers.TryGetValue(capture.Hwnd, out var known))
-            {
-                var minInterval = known.IsScrolling(now) ? 0
-                    : known.Boxes.Count == 0 && known.AnimatedFraction > 0.3 ? 66
-                    : 33;
-                var wait = minInterval - (now - capture.LastProcessedMs);
-                if (wait > 0)
-                {
-                    if (capture.HasPendingFrame) _nextWakeMs = Math.Min(_nextWakeMs, (int)Math.Max(1, wait));
-                    continue;
-                }
-            }
-
+            // Every frame is read as soon as it arrives: new text is noticed on the frame it appears.
             if (!capture.TryAcquire() || capture.Texture is null) continue;
-            capture.LastProcessedMs = now;
 
             var stageStart = Stopwatch.GetTimestamp();
             _gpu!.ReadFrameGray(capture.Texture, capture.Width, capture.Height, _half, _strip);
@@ -752,10 +735,9 @@ public sealed class LiveEngine : IDisposable
     }
 
     /// <summary>
-    /// Starts OCR jobs while there are free readers. Reader 0 takes anything. Reader 1 only takes
-    /// new content in the foreground window (never background re-reads or other windows), never
-    /// while it is scrolling, and only while the PC has CPU to spare: Windows runs OCR on its own
-    /// threads, so its priority cannot be lowered, and this is the guard instead.
+    /// Starts OCR jobs while there are free readers. Reader 0 takes anything. The extra readers
+    /// only take new content (never background re-reads), in any window, and not while the
+    /// foreground window is scrolling.
     /// </summary>
     private void ScheduleOcr(long now)
     {
@@ -767,9 +749,9 @@ public sealed class LiveEngine : IDisposable
             var extra = slot > 0;
             // Measured: during scrolling a second reader added CPU without covering text sooner,
             // so it only helps with text that appears while the first one is busy.
-            if (extra && (SystemBusy(now) || ForegroundScrolling(now))) return;
-            // The second reader is created the first time it is needed, so a quiet PC never pays
-            // for it. Created before any job is taken, so a failure never loses a job.
+            if (extra && ForegroundScrolling(now)) return;
+            // Extra readers are created the first time they are needed, so a quiet PC never pays
+            // for them. Created before any job is taken, so a failure never loses a job.
             if ((_ocrPool[slot] ??= OcrService.TryCreate()) is null) return;
             var request = NextOcrRequest(now, urgentOnly: extra);
             if (request is null) return;
@@ -777,16 +759,12 @@ public sealed class LiveEngine : IDisposable
         }
     }
 
-    /// <param name="urgentOnly">
-    /// For the second reader: only new content in the window being used. Background windows that
-    /// keep changing (a log, a dashboard) would otherwise get read twice as often, for no benefit.
-    /// </param>
+    /// <param name="urgentOnly">For the extra readers: only new content, never background re-reads.</param>
     private OcrRequest? NextOcrRequest(long now, bool urgentOnly)
     {
         // Foreground window first, then anything with new content, then slow background rescans.
         var ordered = _captures.Values
             .Where(c => c.Texture is not null && _trackers.ContainsKey(c.Hwnd))
-            .Where(c => !urgentOnly || c.Hwnd == _foreground)
             .OrderBy(c => c.Hwnd == _foreground ? 0 : 1)
             .ToList();
 
@@ -860,29 +838,6 @@ public sealed class LiveEngine : IDisposable
 
     private bool ForegroundScrolling(long now) =>
         _trackers.TryGetValue(_foreground, out var t) && t.IsScrolling(now);
-
-    // ---- CPU load guard for the second reader ---------------------------------------
-
-    private long _cpuSampledMs;
-    private long _lastIdleTicks, _lastTotalTicks;
-    private bool _systemBusy;
-
-    /// <summary>True while the whole PC is over 75% busy. Sampled at most twice a second.</summary>
-    private bool SystemBusy(long now)
-    {
-        if (now - _cpuSampledMs < 500) return _systemBusy;
-        _cpuSampledMs = now;
-        if (!GetSystemTimes(out var idle, out var kernel, out var user)) return _systemBusy = false;
-
-        // Kernel time includes idle time.
-        var total = kernel + user;
-        var dTotal = total - _lastTotalTicks;
-        var dIdle = idle - _lastIdleTicks;
-        _lastTotalTicks = total;
-        _lastIdleTicks = idle;
-        _systemBusy = dTotal > 0 && 1.0 - (double)dIdle / dTotal > 0.75;
-        return _systemBusy;
-    }
 
     /// <summary>Opt-in latency trace (PRIVACYGUARD_DEBUG_STATS=1): sizes and timings only, never text.</summary>
     private static void TraceOcr(OcrOutcome r)

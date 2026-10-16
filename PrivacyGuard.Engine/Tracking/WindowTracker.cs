@@ -89,9 +89,11 @@ public sealed class WindowTracker
     /// <summary>
     /// How long a window's size must hold still before it is read again as a whole. A drag-resize
     /// delivers a new size every frame; reading each one (a full pass plus enlarged strips, about
-    /// 230 ms of OCR) kept the reader busy and made new text in other windows wait.
+    /// 230 ms of OCR) kept the reader busy and made new text in other windows wait. A drag
+    /// delivers sizes every ~16 ms, so 50 ms still skips them while leaving a new layout
+    /// uncovered as briefly as possible.
     /// </summary>
-    public const long ResizeSettleMs = 150;
+    public const long ResizeSettleMs = 50;
 
     /// <summary>
     /// Longest gap between two frames that still counts as continuous motion. A page that moved
@@ -139,14 +141,16 @@ public sealed class WindowTracker
 
     // Heat map over 16 px blocks of the half-resolution frame. Regions that keep changing in
     // place (video, games, animations) heat up. They get no strict-mode curtain, so a playing
-    // video is not blacked out, and they are re-read at most twice a second, which saves CPU.
+    // video is not blacked out, and they are re-read at most five times a second: often enough
+    // that text over a video is covered quickly, rarely enough that a playing video cannot keep
+    // every reader busy while new text elsewhere waits.
     private byte[] _heat = [];
     private bool[] _dirtyGrid = [];
     private int _gridColumns, _gridRows;
     private long _lastHotOcrMs;
     private long _heatUpdatedMs;
     private const byte HotLevel = 120;
-    private const long HotOcrIntervalMs = 500;
+    private const long HotOcrIntervalMs = 200;
 
     /// <summary>A full-resolution distance in half-resolution pixels, rounded away from zero.</summary>
     private static int ToHalf(int full) => (int)Math.Round(full / 2.0, MidpointRounding.AwayFromZero);
@@ -508,9 +512,6 @@ public sealed class WindowTracker
         // Text runs at roughly 5 to 15% sharp edges; 3% ignores blank areas and their borders.
         return samples > 0 && edges * 100 >= samples * 3;
     }
-
-    /// <summary>Share of the window that is animated. A mostly animated window with nothing hidden can be sampled less often.</summary>
-    public double AnimatedFraction => _heat.Length == 0 ? 0 : _heat.Count(h => h >= HotLevel) / (double)_heat.Length;
 
     private static bool IsSame(GrayImage a, GrayImage b)
     {

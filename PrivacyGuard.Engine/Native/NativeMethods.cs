@@ -110,9 +110,6 @@ internal static partial class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool ClientToScreen(IntPtr hwnd, ref POINT point);
 
-    [DllImport("kernel32.dll")]
-    public static extern bool GetSystemTimes(out long idleTime, out long kernelTime, out long userTime);
-
     public const int GCLP_HBRBACKGROUND = -10;
 
     [DllImport("user32.dll", EntryPoint = "SetClassLongPtrW")]
